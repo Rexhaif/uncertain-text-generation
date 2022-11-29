@@ -13,4 +13,5 @@ python src/evaluate_seq2seq_qa.py \
     --answer-column="answer" \
     --batch-size=16 \
     --use-8bit \
-    --max-new-tokens=128
+    --max-new-tokens=128 \
+    --output-file="./results/t5-large-ssm-nq.csv"

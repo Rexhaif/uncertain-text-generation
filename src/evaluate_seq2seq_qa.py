@@ -1,6 +1,6 @@
 import argparse as ap
-from configparser import MAX_INTERPOLATION_DEPTH
 import logging
+import pandas as pd
 
 import datasets as ds
 import evaluate as ev
@@ -8,6 +8,7 @@ import torch
 import transformers as tr
 from rich.logging import RichHandler
 from tqdm.auto import tqdm
+import ue_methods as ue
 
 logging.basicConfig(
     level="INFO",
@@ -77,6 +78,12 @@ def main():
         default="",
         help="Prefix to add to the beginning of each question",
     )
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        required=True,
+        help="Path to the file where to save the results",
+    )
 
     args = parser.parse_args()
     logger.info(f"Running evaluation with args: {args}")
@@ -88,7 +95,6 @@ def main():
     dataset = ds.load_dataset(
         args.dataset_name, split=args.dataset_split
     )
-    exact_match = ev.load("exact_match")
 
     logger.info("Loading model")
     tokenizer = tr.AutoTokenizer.from_pretrained(args.model_name)
@@ -129,6 +135,11 @@ def main():
 
     logger.info("Evaluating model")
 
+    ue_estimator = ue.BeamScoreMarginUncertaintyEstimator(
+        num_return_sequences=2,
+        do_softmax=False,
+    )
+
     collate_fn = tr.DataCollatorWithPadding(
         tokenizer=tokenizer, padding="longest", max_length=512, pad_to_multiple_of=8, return_tensors="pt"
     )
@@ -136,32 +147,49 @@ def main():
         questions_dataset,
         batch_size=args.batch_size,
         collate_fn=collate_fn,
+        shuffle=False,
+        drop_last=False
     )
 
     model = model.eval()
 
-    predictions = []
+    results = []
     for batch in tqdm(data_loader, unit='batch'):
         inputs = {
             k: v.to(model.device) for k, v in batch.items()
         }
-        answer_ids = model.generate(
+        generation_outputs = model.generate(
             input_ids=inputs['input_ids'],
             attention_mask=inputs['attention_mask'],
             max_new_tokens=args.max_new_tokens,
             num_beams=20,
+            num_beam_groups=20,
+            diversity_penalty=0.5,
             early_stopping=True,
-            num_return_sequences=1,
-            do_sample=False,
+            num_return_sequences=2,
+            output_scores=True,
+            return_dict_in_generate=True
         )
+        ue_estimates = ue_estimator(generation_outputs)
 
-        predictions += tokenizer.batch_decode(answer_ids, skip_special_tokens=True)
+        top_sequence = generation_outputs.sequences.view(inputs['input_ids'].shape[0], 2, -1)[:, 0, :]
 
-    logger.info("Computing metrics")
-    value = exact_match.compute(predictions=predictions, references=answers_dataset)
+        top_sequence = tokenizer.batch_decode(top_sequence, skip_special_tokens=True)
 
-    logger.info(f"Exact match: {value['exact_match']:.4f}")
+        results += [
+            {
+                "predicted_answer": top_sequence[i],
+                "uncertainty_estimate": ue_estimates[i].item(),
+            }
+            for i in range(len(top_sequence))
+        ]
 
+    results = pd.DataFrame(results)
+    results["true_answer"] = answers_dataset
+    results["question"] = dataset[args.question_column]
+
+    logger.info("Saving results")
+    results.to_csv(args.output_file, index=False, encoding="utf-8")
 
 if __name__ == "__main__":
     main()
